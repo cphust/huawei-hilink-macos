@@ -1,53 +1,127 @@
-# 华为 E8372h-155 USB 联网工具（M4 Mac mini）
+# HiLinkSwitch for macOS
 
-将华为随身 WiFi 从安装光盘模式切换为 macOS 自带 ECM 驱动可识别的 USB 网卡。工具不修改网络服务顺序、IP、路由、DNS、Wi-Fi、VPN 或设备固件。
+**English** | [简体中文](README.zh-CN.md)
 
-目标环境：M4 Mac mini、macOS 15.1.1、E8372h-155，固件 `21.335.03.02.233`。首版只主动切换 `12d1:1f01`；这台设备实测切换后为 `12d1:14db`。其他型号没有验证。
+Use a **Huawei E8372h-155 HiLink modem** as a USB network interface on an Apple Silicon Mac. This tool switches the modem out of its virtual installer CD-ROM mode; networking is then handled by the **ECM driver included with macOS**.
 
-## 本机验证状态（2026-10-25）
+Tested on an **M4 Mac mini running macOS 15.1.1**. The project includes a native arm64 command-line tool, a user LaunchAgent, and diagnostic scripts for the original remote-access environment. It does not install a custom kernel extension or replace Apple's network driver.
 
-| 项目 | 结果 |
-|---|---|
-| 原生 arm64 构建、代码签名及关键判定测试 | 通过 |
-| USB 手动切换 | 通过；AppleUserECM 驱动，新增 en9，地址 192.168.8.170 |
-| 管理页 | 绑定 en9 的 GET 请求返回 HTTP 200 |
-| USB DNS 与 HTTPS | 通过；套接字绑定 en9，向设备 DNS 查询，并直接连接结果 IP，TLS 校验通过，Apple 网站返回 200 |
-| NoMachine | 切换前后同一会话保持；192.168.0.34:4000 ↔ 192.168.0.69，路由仍经 en0 |
-| 原网络服务 | 现有配置及相对顺序未变；系统新增 HUAWEI_MOBILE DHCP 服务 |
-| Wi-Fi / Shadowrocket | 保持启用；默认路由仍为 utun4 |
-| 10 分钟稳定性 | 通过；16:59–17:09，11 轮 DNS/HTTPS 全部成功，NoMachine 对端路由始终为 en0 |
-| LaunchAgent 自动任务 | 已按用户确认启用；当前用户事件监听已注册，首次检查正常退出，退出码 0，无循环重启 |
-| 安装/卸载/重新安装 | 实测通过；卸载期间 USB 网卡保持就绪，最终已恢复自动任务 |
-| 三次物理插拔、重新登录、睡眠唤醒 | 待用户配合验证 |
-| 关闭 Wi-Fi / 暂停 VPN 的独立隔离测试 | 未执行，遵守当前远程连接约束 |
+> **Before installing:** manual status/switch commands discover the USB interface dynamically. However, the diagnostic scripts and `install.sh` depend on the original NoMachine network. Read [Remote-access guard](#remote-access-guard) before using them on another Mac.
 
-**绑定 USB 的请求已通过，不代表默认的全部应用流量已改走 USB，也不代替关闭 Wi-Fi/VPN 后的隔离验收。** `--status` 中 `internet=not_tested` 表示该只读命令不发送网络请求；外网结果由 `check.py` 单独给出。
+## Contents
 
-IP 和 `en9` 是这次实测结果，不写死在切换程序中。每次运行会重新沿 USB 设备树识别接口与实际地址。
+- [Compatibility and requirements](#compatibility-and-requirements)
+- [Quick start](#quick-start)
+- [Commands, states, and exit codes](#commands-states-and-exit-codes)
+- [USB connectivity checks](#usb-connectivity-checks)
+- [Remote-access guard](#remote-access-guard)
+- [Automatic switching](#automatic-switching)
+- [Uninstallation](#uninstallation)
+- [How it works](#how-it-works)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Validation and limitations](#validation-and-limitations)
+- [Origin and license](#origin-and-license)
 
-## 构建、检查与手动切换
+## Compatibility and requirements
 
-在本项目目录运行：
+| Item | Current scope |
+| --- | --- |
+| Tested Mac / OS | M4 Mac mini; macOS 15.1.1, build `24B2091` |
+| Tested modem | Huawei E8372h-155; HiLink firmware `21.335.03.02.233` |
+| USB ID eligible for a switch request | `12d1:1f01` only |
+| Observed USB ID / driver after switching | `12d1:14db` / `AppleUserECM` |
+| Build output | Native `arm64`; no Intel or universal binary |
+| Build tools | Xcode Command Line Tools: `xcrun clang`, macOS SDK, `codesign` |
+| Diagnostics | Python 3, standard library only; installer/tests use `/usr/bin/python3` |
+| Privileges | Current logged-in user; no `sudo`; installer/uninstaller reject root |
+
+The macOS 12.0 deployment target in `build.sh` is a compiler setting, **not evidence of compatibility testing on every macOS release from 12 onward**. Other Macs, OS versions, modem models, firmware versions, and Intel builds are unverified. AT-command/PPP “stick” firmware is outside the current scope.
+
+If Command Line Tools are missing:
 
 ```sh
-sh build.sh
-sh test.sh
-sh status.sh
-./build/hilink-switch --switch
+xcode-select --install
 ```
 
-- `--status` 或无参数：只读检查。
-- `--switch`：只切换一次；最多等待 60 秒，已经就绪则不发送请求。
-- `--launchd`：供后台任务调用，不需要手动使用。
-- 程序为本机编译的 arm64 可执行文件，采用临时代码签名，无需华为旧安装器。
+The program links Apple's IOKit, CoreFoundation, and DiskArbitration frameworks. No Homebrew package, third-party Python package, legacy Huawei installer, firmware update, or system-security change is required.
 
-状态依次可能为 `cdrom`、`absent`、`waiting_driver`、`waiting_interface`、`waiting_address`、`address_ready`。短暂的 `absent` 只是重新枚举过程，不是成功标志。
+## Quick start
 
-退出码：0=地址与链路就绪；1=系统查询或准备失败；2=参数错误；3=未发现设备；4=多个候选设备/接口；5=尚未就绪、超时或不支持；75=另一切换实例运行中或无法取得锁。后台在登录时未发现设备会正常退出。
+Clone and build/test the source. A private repository requires access permission.
 
-程序只卸载目标华为设备所属的卷。可写卷卸载失败即停止。只读光盘只有“忙”错误才允许强制卸载。本机直接调用 DiskArbitration 返回 `kDAReturnNotPrivileged`，因此在该错误下调用系统 `diskutil unmountDisk` 正常卸载同一目标磁盘；不使用 sudo、不调整权限。
+```sh
+git clone https://github.com/cphust/huawei-hilink-macos.git
+cd huawei-hilink-macos
+sh test.sh
+sh status.sh
+```
 
-## 网络证据与远程连接保护
+`test.sh` builds the program, runs policy tests, and checks shell, Python, and plist syntax. It does not switch hardware, install a job, or test Internet access. For a build alone, run `sh build.sh`.
+
+Connect one supported modem. If status reports `state=cdrom`, close files open on its virtual CD or memory card, then request one switch:
+
+```sh
+./build/hilink-switch --switch
+sh status.sh
+```
+
+Example successful output; the interface, address, and location are illustrative, not required values:
+
+```text
+state=address_ready
+devices=1
+usb_id=12d1:14db
+location=0x01120000
+driver=AppleUserECM
+interface=en9
+ipv4=192.168.8.170
+internet=not_tested
+```
+
+`address_ready` means an ECM driver, one network interface, active interface flags, and a usable IPv4 address were found under the same USB device. The address check excludes zero, loopback, and IPv4 link-local addresses; it does not inspect the DHCP lease. **It does not prove Internet access or that other applications use USB.** Status is read-only and always reports `internet=not_tested`.
+
+`sh status.sh` returns nonzero when the modem is absent or not ready; this is an expected diagnostic result. If already ready, `--switch` exits without sending another control request.
+
+## Commands, states, and exit codes
+
+| Command | Behavior |
+| --- | --- |
+| `./build/hilink-switch` | Same read-only query as `--status` |
+| `./build/hilink-switch --status` | Reports USB, driver, interface, and IPv4 state; no network requests |
+| `./build/hilink-switch --switch` | Attempts one switch or waits for an enumerating device; 60-second overall limit |
+| `./build/hilink-switch --launchd` | LaunchAgent entry point; registers the event-stream handler before switching/checking |
+| `sh status.sh` | Calls the built program with `--status` |
+
+| `state` | Meaning |
+| --- | --- |
+| `query_error` | USB enumeration/query failed |
+| `absent` | No matching Huawei device; also possible during re-enumeration |
+| `ambiguous` | Multiple Huawei USB devices or multiple network interfaces under the selected device |
+| `cdrom` | Supported installer-mode ID `12d1:1f01` |
+| `unsupported` | A network interface exists without the expected ECM driver |
+| `waiting_driver` | Waiting for an ECM driver under a non-CD-ROM device |
+| `waiting_interface` | ECM driver exists, but the network interface has not appeared |
+| `waiting_address` | Interface is not active or has no acceptable IPv4 address |
+| `address_ready` | Driver, interface, active flags, and IPv4 checks passed |
+
+Initial discovery counts all Huawei devices with vendor ID `12d1`; another Huawei device can make the result ambiguous even if it is not an E8372h-155. After switching, the program follows the original USB physical location. Disappearance alone is never success.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Address/interface ready; also used by `--launchd` when no device is present initially |
+| `1` | System query, disk preparation, or unmount failed |
+| `2` | Invalid arguments |
+| `3` | No Huawei device during the initial query |
+| `4` | Ambiguous device/interface selection |
+| `5` | Not ready, unsupported, or timed out |
+| `75` | Another switching instance holds the lock, or the per-user lock cannot be acquired |
+
+These tables describe the C executable. Wrapper scripts can also fail during build, verification, or installation. `--switch` may print initial and final status blocks to stdout; progress and errors go to stderr.
+
+## USB connectivity checks
+
+Review the [remote-access guard](#remote-access-guard) first:
 
 ```sh
 python3 snapshot.py artifacts/before.json
@@ -56,66 +130,160 @@ python3 check.py --duration 600 --output artifacts/stability.jsonl
 python3 snapshot.py artifacts/after.json
 ```
 
-文件名必须尚不存在，避免覆盖原始证据。原始快照和运行记录位于 Git 忽略的 `artifacts/`，文件权限为 600；不要对外发布含本地网络信息的原始快照。
+Use a new filename for every run. Both scripts refuse to overwrite existing output. Files are created with mode `0600`; newly created evidence directories use `0700`. `artifacts/` and `build/` are ignored by Git.
 
-`snapshot.py` 记录配置、服务顺序、路由、DNS、NoMachine 连接及 USB 状态，不会恢复或修改任何设置。受限执行环境中若系统拒绝路由查询，应在已授权的普通本机终端运行，不能把查询失败当成检查通过。
+`check.py` performs these steps:
 
-`check.py` 针对本项目的远程使用场景检查：
+1. Requires `address_ready` and verifies the fixed remote-access guard.
+2. Reads the selected USB interface's DHCP router and DNS server.
+3. Binds each IPv4 socket to that USB interface with macOS `IP_BOUND_IF`, and to its IPv4 address.
+4. Sends an HTTP `HEAD` request to the modem gateway.
+5. Queries the DHCP DNS server directly for IPv4 addresses, verifies a scoped USB route, and sends an HTTPS `HEAD` request to a returned address. TLS certificate and hostname verification remain enabled.
+6. Tries `www.apple.com.cn`, then `www.baidu.com` if necessary, using up to two returned IPv4 addresses per host. These requests do not use environment proxies or the system DNS resolver.
 
-1. 到 NoMachine 对端 192.168.0.69 的路由仍指向 en0，en0 仍为 192.168.0.34/24 且激活。
-2. 通过 macOS `IP_BOUND_IF` 将每个测试套接字绑定到动态识别的 USB 接口，同时绑定该接口的 IPv4 地址。
-3. 向 DHCP 下发的路由器访问 HTTP；部分华为管理页不支持 HEAD，会返回 405，这表示链路可达，管理页 GET 已另行实测为 200。
-4. 向 DHCP 下发的 DNS 服务器发送 A 查询，直接使用其结果完成 HTTPS，避免系统代理 DNS 的 Fake IP。优先检查 Apple 中国网站，失败时尝试百度。
-5. 记录接口、本地/远端地址、DNS 与 HTTPS 结果；不使用环境代理，TLS 证书正常校验。
+The script accepts a valid HTTP response with a status below 500, including redirects and client errors. A gateway `405 Method Not Allowed` response to `HEAD` demonstrates a response, not a successful page fetch. Inspect the actual status; a successful check does not necessarily mean HTTP 200.
 
-持续检查每分钟一次，不做测速或大文件下载。任何一轮失败即以非零状态退出，并保留此前记录。`check.py` 的固定 NoMachine 保护地址只适用于本项目当前网络；换用其他网络时先核对保护条件，不直接删掉检查。
+`--duration` accepts integer seconds from `0` to `600`; `0` means one check. Repeated checks are scheduled every 60 seconds and at the requested endpoint. Network processing can extend wall-clock time. The first failed round returns nonzero; earlier successful JSONL records remain. This is a low-traffic connectivity check, not a speed test.
 
-## 安装当前用户的自动切换
+`snapshot.py` records service configuration/order, routes, DNS, interface state, NoMachine connections, and USB status, including command return codes. It does not restore or edit settings. A saved snapshot with failed queries is not proof that the queried state is correct.
 
-仅在手动 USB 检查通过，并明确接受仍待完成的隔离验收项后执行：
+Raw evidence can include private IP addresses, service identifiers, and connection details. Keep it local and share a reviewed, redacted summary when reporting a problem.
+
+## Remote-access guard
+
+The reference Mac was operated through NoMachine. These assumptions are embedded in the current source:
+
+| Source | Assumption |
+| --- | --- |
+| `check.py` | Route to `192.168.0.69` must use `en0` |
+| `check.py` | `en0` must be active with `192.168.0.34/24` |
+| `snapshot.py` | Records `en0`, `en1`, TCP port `4000`, and routes to `192.168.0.69` and `192.168.8.1` |
+| `install.sh` | Runs `/usr/bin/python3 check.py`; a failure stops installation |
+
+These are reference-environment conditions, **not addresses to assign to another Mac**. A different network can fail the guard while its USB modem works correctly. There are no command-line options to configure the guard.
+
+For another deployment, first use the read-only/manual tool, then review and adapt the guard and snapshot targets to the actual remote session before running diagnostics or the installer. Preserve a verified remote path and recovery method. The USB interface and USB IPv4 address are discovered dynamically, not fixed to `en9` or the example address.
+
+The switcher, installer, and diagnostics do not edit service priority, static IP settings, routes, DNS configuration, Wi-Fi, VPN settings, or modem firmware. macOS can automatically add a `HUAWEI_MOBILE` DHCP service after re-enumeration. USB-bound checks do not change the default route for ordinary applications.
+
+## Automatic switching
+
+After a successful manual switch and USB connectivity check, run as the logged-in user:
 
 ```sh
 sh install.sh
 ```
 
-安装器会重新构建、确认地址就绪并运行一次 USB 通信检查；失败时不注册后台任务。请以当前登录用户运行，不要使用 sudo。
+The installer rebuilds, requires `--status` to succeed, and runs the guarded USB check before writing installation files or registering the job. It does not perform the initial manual switch. Existing same-named installations without this project's ownership marker are not overwritten.
 
-安装内容：
+| Item | Installed path |
+| --- | --- |
+| Executable | `~/Library/Application Support/HiLinkSwitch/hilink-switch` |
+| Ownership marker | `~/Library/Application Support/HiLinkSwitch/.managed-by-hilink-switch` |
+| LaunchAgent | `~/Library/LaunchAgents/local.hilink-switch.plist` |
+| Log | `~/Library/Logs/hilink-switch.log` |
 
-- 程序：`~/Library/Application Support/HiLinkSwitch/hilink-switch`
-- 用户启动配置：`~/Library/LaunchAgents/local.hilink-switch.plist`
-- 日志：`~/Library/Logs/hilink-switch.log`
+The destination directory and executable use `0700`; the marker, plist, and log use `0600`. The executable has a local ad-hoc signature, not an Apple Developer ID signature or notarization.
 
-LaunchAgent 仅监听 `12d1:1f01` 的插入事件，并在用户登录时检查一次。任务完成后退出，没有持续轮询或 KeepAlive 循环。只有当前用户已登录时工作；后台运行权限若被用户关闭，自动触发会停止。
+The LaunchAgent checks once at login and responds to insertion of `12d1:1f01`. Each invocation exits when finished; there is no permanent polling process or `KeepAlive` loop. It operates only in the current user's GUI session, not before login. Keep the corresponding background item allowed in macOS settings.
 
 ```sh
 launchctl print "gui/$(id -u)/local.hilink-switch"
 tail -n 40 "$HOME/Library/Logs/hilink-switch.log"
 ```
 
-该任务按事件运行，因此 `state = not running`、`last exit code = 0`、`watching = 1` 表示检查已正常结束且在监听下一次插入，并非故障。
+`state = not running`, `last exit code = 0`, and an event entry with `watching = 1` are consistent with a healthy job waiting for its next event. They do not prove physical replug, logout/login, or wake testing.
 
-安装与后台任务均不调整网络优先级。若以后需要 USB 优先于 Wi-Fi，应在具备恢复条件的窗口仅调整新增华为服务，保持 en0 和其他原有服务的配置与相对顺序；本项目脚本不会自动执行这一步。
+If bootstrap fails, the installer removes the plist and leaves the executable, marker, and log for diagnosis. Re-running `sh install.sh` rebuilds and rechecks a recognized installation. Installation never makes USB the preferred/default network service.
 
-## 卸载与异常处理
+## Uninstallation
+
+Run as the same user who installed it:
 
 ```sh
 sh uninstall.sh
 ```
 
-卸载器检查安装归属后停止用户任务，只移除本项目的程序、标记和启动配置，保留源码、日志及系统自动创建的网络服务。因为本工具没有主动修改网络配置，无需恢复 en0、Wi-Fi 或 VPN 设置。设备已经处于网络模式时可继续使用，重新插拔后不再自动切换。
+The script verifies the ownership marker, unloads the job if present, and removes the executable, marker, and plist. Source, logs, and network services created by macOS are retained. An unknown installation is untouched; an absent installation exits successfully.
 
-- 停在光盘模式：查看错误；可关闭正在访问 HiLink 的程序，再手动重试。
-- 卷卸载失败：停止切换，不强制卸载可写存储卡。
-- 新设备没有网卡：记录 USB 描述符和驱动匹配信息，不安装旧 kext 或改变系统安全设置。
-- 网卡有但无地址：检查 HUAWEI_MOBILE 服务的 DHCP 状态；程序不会自行写入静态 IP。
-- 外网检查失败：区分移动信号、DNS、目标站点和 VPN 路由。单个公网 IP 不可达不能证明 USB 不可用；本次 1.1.1.1:443 未连通，而 USB 上的域名解析与 Apple HTTPS 已通过。
-- NoMachine 保护检查失败：停止后续网络调整，优先保留原有连接。
+A modem already in network mode can remain connected. After a later replug, this tool will no longer switch it automatically. There are no program-written network settings to restore.
 
-未完成的物理插拔、隔离、登录和唤醒验收，需要在用户能恢复现场连接时安排。不得将模拟状态测试写成物理测试通过。
+## How it works
 
-## 来源与许可
+```mermaid
+flowchart TD
+    A[Find one Huawei USB device] --> B{Requested operation}
+    B -->|Status| C[Report driver, interface and IPv4]
+    B -->|Switch from CD-ROM mode| D[Unmount only this device's disks]
+    D --> E[Send one vendor USB control request]
+    E --> F[Wait at the original USB physical location]
+    F --> G[ECM driver and network interface appear]
+    G --> H[Check active flags and usable IPv4]
+    H --> I[address_ready]
+    I --> J[Separate script verifies USB DNS and HTTPS]
+```
 
-源自 [function0xMarki/Huawei_HiLinkSwitch_4G-Routers](https://github.com/function0xMarki/Huawei_HiLinkSwitch_4G-Routers)，固定提交 `f4f0aac8d33a152cf60db53cecd555daa1d6dae1`，保留 MIT 许可证。原始文件的 Git blob 哈希已逐项核对；本仓库基线提交为 `1c20fdd`。
+The diagram shows the successful CD-ROM path. Ambiguous selection, unmount failures, unsupported states, and timeout stop the operation.
 
-本地适配主要增加状态分层、实际 ECM/网卡/IP 判定、当前设备范围与互斥、卸载兼容处理，以及远程连接保护下的检查与安装流程。上游在 Intel Mac 的结果不作为本机验证依据。
+The USB request uses `bmRequestType=0x40`, `bRequest=0xA1`, and zero `wValue`, `wIndex`, and data length. Re-enumeration can interrupt its response, so success is determined from the resulting device/interface state, not the request's return value alone.
+
+Disk operations are limited to whole media below the selected device. Writable media is never force-unmounted. A read-only volume is eligible for force only after a “busy” result and a same-media check. A DiskArbitration permission failure falls back to `/usr/sbin/diskutil unmountDisk` on the same target, without `sudo` or force. Other preparation failures stop switching.
+
+Manual/background switching share a nonblocking per-user file lock. It is released when the process exits; the file stays in the user's temporary directory. A 60-second alarm bounds switching, including blocked operations. The core executable itself makes no DNS or HTTP requests.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `absent` | USB connection/power and macOS device visibility; absence during switching can be temporary |
+| `ambiguous` | Disconnect additional Huawei devices; the program will not guess a target |
+| Stays in `cdrom` | Run explicit `--switch`, read stderr, and close applications using its volumes |
+| Unmount failed | Close open files; writable memory cards are never force-unmounted |
+| `waiting_driver` / `unsupported` | Record model, firmware, USB ID, and driver association; only the listed setup is validated |
+| `waiting_interface` | Check re-enumeration/driver state; a disappeared CD-ROM is insufficient |
+| `waiting_address` | Check the `HUAWEI_MOBILE` DHCP/link state; the tool does not assign static IPs |
+| `internet=not_tested` | Expected status output; use the separate check after reviewing its guard |
+| `en0` / NoMachine mismatch | Compare the actual network to the embedded guard; do not change the Mac's IP to match the example |
+| USB checks pass, applications still use Wi-Fi/VPN | Review application/default routing; the tool does not change priorities |
+| HTTPS/DNS fails | Distinguish coverage, DHCP DNS, destination reachability, and routing; inspect the exact error/status |
+| Automatic task looks idle | Inspect exit code, event subscription, background permission, and log; idle is normal between events |
+| Exit `75` | Wait for another invocation; persistent failure can also mean an inaccessible lock path |
+| Snapshot route query denied | Repeat read-only diagnostics in an authorized local Terminal if the execution environment restricts queries |
+
+In the reference setup, `1.1.1.1:443` was unreachable while USB DNS and Apple HTTPS succeeded. One unavailable endpoint is not a conclusive USB-link test. A management `HEAD` response of 405 is also different from a failed TCP connection.
+
+For issue reports, include Mac/OS and modem/firmware versions, redacted status/error output, and the exact command/exit code. Review logs and snapshots before sharing. The archived Spanish upstream document is not an installation guide for this adaptation.
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `hilink-switch.c` | Discovery, state classification, unmount, USB request, timeout, lock, background entry |
+| `build.sh` / `status.sh` | arm64 build/signing and read-only status wrapper |
+| `check.py` / `snapshot.py` | Guarded USB checks and read-only network evidence |
+| `install.sh` / `uninstall.sh` | Managed installation/removal in the current user's Library |
+| `local.hilink-switch.plist.in` | LaunchAgent template; installer inserts executable/log paths |
+| `tests/test_policy.c` / `test.sh` | Policy tests and build/syntax checks |
+| `docs/VALIDATION.md` | Validation record and outstanding acceptance tests |
+| `README.zh-CN.md` | Complete Chinese guide |
+| `README-ES.md` | Archived upstream Spanish guide; behavior differs |
+| `LICENSE` | Original MIT license and copyright |
+| `build/`, `artifacts/` | Generated files/private evidence, excluded from Git |
+
+## Validation and limitations
+
+The **2026-10-25** reference run switched `12d1:1f01` to `12d1:14db`, loaded `AppleUserECM`, and obtained IPv4. The retained 10-minute record contains **11 successful USB-bound DNS/HTTPS rounds**, all with HTTPS 200 and the NoMachine peer route still on `en0`. Original network-service configuration and relative order were preserved.
+
+During GitHub preparation, the arm64 build, policy tests, shell/Python/plist checks, code-signature verification, and live read-only USB status query passed again. Installation, uninstallation, switching, and network probes were not repeated during documentation work.
+
+Three physical replug cycles, logout/login, sleep/wake, extended operation, and isolation with Mac Wi-Fi and VPN disabled remain unverified. Other models/firmware are not covered. See the [detailed validation record](docs/VALIDATION.md) and [中文版](docs/VALIDATION.zh-CN.md).
+
+## Origin and license
+
+Adapted from [function0xMarki/Huawei_HiLinkSwitch_4G-Routers](https://github.com/function0xMarki/Huawei_HiLinkSwitch_4G-Routers), pinned at [`f4f0aac8d33a152cf60db53cecd555daa1d6dae1`](https://github.com/function0xMarki/Huawei_HiLinkSwitch_4G-Routers/commit/f4f0aac8d33a152cf60db53cecd555daa1d6dae1).
+
+The original [MIT license](LICENSE) and copyright are retained. Local import baseline: `1c20fdd`; reference-device/Apple Silicon adaptation: `791c5ce`.
+
+The adaptation adds read-only defaults, explicit state/exit reporting, ECM/interface/IPv4 readiness checks, a narrower active-switch ID, ambiguity checks, per-user locking, bounded unmount/switch handling, and guarded installation/diagnostics. Upstream Intel results are not validation of this Apple Silicon adaptation.
+
+**English** | [简体中文](README.zh-CN.md)

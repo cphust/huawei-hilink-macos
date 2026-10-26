@@ -1,6 +1,12 @@
-# 历史上游文档
+# Archived upstream documentation / 上游历史文档
 
-此文件保留上游原说明作为来源参考；本项目已改变默认行为、支持范围与安装检查。实际操作请以 [README.md](README.md) 为准，不按下文直接执行。
+[Current English guide](README.md) | [当前中文指南](README.zh-CN.md)
+
+This Spanish document is preserved for provenance. Its commands, supported devices, build targets, and uninstall behavior describe the upstream version, not this adaptation. Use the current English or Chinese guide above.
+
+此文件保留上游原说明作为来源参考；当前默认行为、支持范围、构建目标和卸载方式已有变化。实际操作请以上面的中英文指南为准，不按下文直接执行。
+
+Este documento conserva la versión original como referencia histórica. Para esta adaptación, consulta la guía actual en inglés o chino; los comandos y el alcance de compatibilidad que siguen no están actualizados.
 
 # HiLinkSwitch
 
