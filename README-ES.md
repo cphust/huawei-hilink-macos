@@ -1,3 +1,7 @@
+# 历史上游文档
+
+此文件保留上游原说明作为来源参考；本项目已改变默认行为、支持范围与安装检查。实际操作请以 [README.md](README.md) 为准，不按下文直接执行。
+
 # HiLinkSwitch
 
 <div align="center">

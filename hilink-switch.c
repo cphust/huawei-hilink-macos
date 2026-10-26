@@ -1,49 +1,58 @@
 /*
- * hilink-switch: switches Huawei HiLink modems and routers from "CD-ROM"
- * mode (12d1:1f01 and similar) to CDC-ECM network mode, which macOS drives
- * with its own AppleUserECM driver.
+ * HiLinkSwitch — based on function0xMarki/HiLinkSwitch, MIT License.
+ * Upstream: f4f0aac8d33a152cf60db53cecd555daa1d6dae1
  *
- * It does the same as the mbbservice daemon from Huawei's installer on
- * macOS > 10.9: it unmounts the device's volumes (virtual CD and memory
- * card) and sends it a vendor USB control request: bmRequestType 0x40,
- * bRequest 0xA1, no data. The device disconnects and comes back as a
- * network interface.
- *
- * Usage:
- *   hilink-switch            find the device and switch it
- *   hilink-switch --launchd  the same, started by launchd when plugged in
- *
- * Build:
- *   clang -O2 -Wall -o hilink-switch hilink-switch.c \
- *         -framework IOKit -framework CoreFoundation -framework DiskArbitration
+ * 为 E8372h-155 提供只读状态与单次 USB 模式切换。
+ * 不修改网络服务、路由、DNS、Wi-Fi、VPN 或系统安全设置。
  */
-
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/usb/IOUSBLib.h>
+#include <arpa/inet.h>
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
 
 #define HUAWEI_VID 0x12d1
-
-/* CD-ROM mode PIDs watched by mbbservice (ArConfig.dat, [PRODUCT_ID]) */
-static const int64_t cdrom_pids[] = { 0x1f01, 0x1f02, 0x157d, 0x158b };
-
-/* What mbbservice's activateDevice() sends */
-#define SWITCH_REQTYPE 0x40 /* vendor, host to device, recipient device */
-#define SWITCH_REQUEST 0xA1
-
+#define CDROM_PID 0x1f01
 #define MAX_DISKS 8
+#define WAIT_SECONDS 60
+
+extern char **environ;
+
+enum state { QUERY_ERROR, ABSENT, AMBIGUOUS, CDROM, UNSUPPORTED,
+             WAIT_DRIVER, WAIT_INTERFACE, WAIT_ADDRESS, READY };
+struct device {
+    io_service_t service;
+    int64_t pid, location;
+    bool ecm, link;
+    int interfaces;
+    char interface[IF_NAMESIZE], ipv4[INET_ADDRSTRLEN], driver[128];
+};
+
+static double monotime(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
 
 static void logmsg(const char *fmt, ...)
 {
@@ -60,8 +69,6 @@ static void logmsg(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
-/* Numeric registry property, or -1 if missing. 64 bits so that location
-   IDs from 0x80000000 up are not truncated. */
 static int64_t int_property(io_service_t svc, CFStringRef key)
 {
     int64_t value = -1;
@@ -74,279 +81,442 @@ static int64_t int_property(io_service_t svc, CFStringRef key)
     return value;
 }
 
-/* Connected USB devices. IOKit does not accept idVendor alone as a
-   matching key (it goes with idProduct), so the vendor is filtered later. */
+static bool string_property(io_service_t svc, CFStringRef key, char *buf, size_t size)
+{
+    bool ok = false;
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(svc, key, kCFAllocatorDefault, 0);
+    if (ref) {
+        if (CFGetTypeID(ref) == CFStringGetTypeID())
+            ok = CFStringGetCString(ref, buf, (CFIndex)size, kCFStringEncodingUTF8);
+        CFRelease(ref);
+    }
+    return ok;
+}
+
 static kern_return_t usb_devices(io_iterator_t *it)
 {
     return IOServiceGetMatchingServices(kIOMainPortDefault,
-                                        IOServiceMatching(kIOUSBHostDeviceClassName), it);
+        IOServiceMatching(kIOUSBHostDeviceClassName), it);
 }
 
-static bool is_cdrom_pid(int64_t pid)
+static bool usable_ipv4(uint32_t address)
 {
-    for (size_t i = 0; i < sizeof cdrom_pids / sizeof cdrom_pids[0]; i++)
-        if (cdrom_pids[i] == pid)
-            return true;
-    return false;
+    uint32_t a = ntohl(address);
+    return a && (a >> 24) != 127 && (a >> 16) != 0xa9fe;
 }
 
-static bool is_huawei_cdrom(io_service_t dev)
-{
-    return int_property(dev, CFSTR(kUSBVendorID)) == HUAWEI_VID
-        && is_cdrom_pid(int_property(dev, CFSTR(kUSBProductID)));
-}
-
-/* Whole disks (diskN) under the USB device: virtual CD and memory card.
-   Keeps the registry objects, not their BSD names: a diskN number freed by
-   an unplugged device can be given to another disk. */
-static int find_disks(io_service_t dev, io_object_t media[], int max)
+static void read_network(struct device *d)
 {
     io_iterator_t it;
-    int n = 0;
-    if (IORegistryEntryCreateIterator(dev, kIOServicePlane, kIORegistryIterateRecursively, &it) != KERN_SUCCESS)
-        return 0;
+    if (IORegistryEntryCreateIterator(d->service, kIOServicePlane,
+            kIORegistryIterateRecursively, &it) != KERN_SUCCESS)
+        return;
     io_object_t obj;
     while ((obj = IOIteratorNext(it))) {
-        if (n < max && IOObjectConformsTo(obj, kIOMediaClass)) {
-            CFTypeRef whole = IORegistryEntryCreateCFProperty(obj, CFSTR(kIOMediaWholeKey), kCFAllocatorDefault, 0);
-            if (whole == kCFBooleanTrue) {
-                media[n++] = obj; /* the caller releases it */
-                obj = IO_OBJECT_NULL;
-            }
-            if (whole)
-                CFRelease(whole);
+        io_name_t name = "";
+        IORegistryEntryGetName(obj, name);
+        if (!strcmp(name, "AppleUserECM") || !strcmp(name, "AppleUSBECMControl")) {
+            d->ecm = true;
+            snprintf(d->driver, sizeof d->driver, "%s", name);
         }
-        if (obj)
-            IOObjectRelease(obj);
+        if (IOObjectConformsTo(obj, "IONetworkInterface")) {
+            char bsd[IF_NAMESIZE] = "";
+            if (string_property(obj, CFSTR("BSD Name"), bsd, sizeof bsd)) {
+                d->interfaces++;
+                snprintf(d->interface, sizeof d->interface, "%s", bsd);
+            }
+        }
+        IOObjectRelease(obj);
     }
     IOObjectRelease(it);
+    struct ifaddrs *addresses;
+    if (getifaddrs(&addresses) != 0)
+        return;
+    for (struct ifaddrs *a = addresses; a; a = a->ifa_next) {
+        if (strcmp(a->ifa_name, d->interface))
+            continue;
+        d->link = (a->ifa_flags & IFF_UP) && (a->ifa_flags & IFF_RUNNING);
+        if (a->ifa_addr && a->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)a->ifa_addr;
+            if (usable_ipv4(sin->sin_addr.s_addr))
+                inet_ntop(AF_INET, &sin->sin_addr, d->ipv4, sizeof d->ipv4);
+        }
+    }
+    freeifaddrs(addresses);
+}
+
+/* location=-1 用于初次查找；切换后只等待原 USB 物理位置，避免认错别的网卡。 */
+static int scan(int64_t location, struct device *d)
+{
+    memset(d, 0, sizeof *d);
+    io_iterator_t it;
+    if (usb_devices(&it) != KERN_SUCCESS)
+        return -1;
+    int count = 0;
+    io_service_t dev;
+    while ((dev = IOIteratorNext(it))) {
+        if (int_property(dev, CFSTR(kUSBVendorID)) == HUAWEI_VID &&
+            (location == -1 || int_property(dev, CFSTR(kUSBDevicePropertyLocationID)) == location)) {
+            count++;
+            if (count == 1) {
+                d->service = dev;
+                d->pid = int_property(dev, CFSTR(kUSBProductID));
+                d->location = int_property(dev, CFSTR(kUSBDevicePropertyLocationID));
+                read_network(d);
+                continue;
+            }
+        }
+        IOObjectRelease(dev);
+    }
+    IOObjectRelease(it);
+    return count;
+}
+
+static void release_device(struct device *d)
+{
+    if (d->service)
+        IOObjectRelease(d->service);
+    d->service = IO_OBJECT_NULL;
+}
+
+static enum state classify(int count, const struct device *d)
+{
+    if (count < 0) return QUERY_ERROR;
+    if (!count) return ABSENT;
+    if (count > 1 || d->interfaces > 1) return AMBIGUOUS;
+    if (d->pid == CDROM_PID) return CDROM;
+    if (!d->ecm) return d->interfaces ? UNSUPPORTED : WAIT_DRIVER;
+    if (!d->interfaces) return WAIT_INTERFACE;
+    if (!d->link || !d->ipv4[0]) return WAIT_ADDRESS;
+    return READY;
+}
+
+static const char *state_name(enum state s)
+{
+    const char *names[] = { "query_error", "absent", "ambiguous", "cdrom",
+        "unsupported", "waiting_driver", "waiting_interface", "waiting_address", "address_ready" };
+    return names[s];
+}
+
+static int state_exit(enum state s)
+{
+    if (s == READY) return 0;
+    if (s == QUERY_ERROR) return 1;
+    if (s == ABSENT) return 3;
+    if (s == AMBIGUOUS) return 4;
+    return 5;
+}
+
+static void report(int count, const struct device *d)
+{
+    enum state s = classify(count, d);
+    printf("state=%s\n", state_name(s));
+    printf("devices=%d\n", count);
+    if (count == 1) {
+        printf("usb_id=12d1:%04llx\nlocation=0x%08llx\n",
+            (long long)d->pid, (long long)d->location);
+        printf("driver=%s\ninterface=%s\nipv4=%s\n",
+            d->driver[0] ? d->driver : "none",
+            d->interface[0] ? d->interface : "none",
+            d->ipv4[0] ? d->ipv4 : "none");
+    }
+    /* DHCP 就绪不代表互联网已验证；外网测试由独立脚本完成。 */
+    printf("internet=not_tested\n");
+    fflush(stdout);
+}
+
+static int find_disks(io_service_t dev, io_object_t media[])
+{
+    io_iterator_t it;
+    if (IORegistryEntryCreateIterator(dev, kIOServicePlane,
+            kIORegistryIterateRecursively, &it) != KERN_SUCCESS)
+        return -1;
+    int n = 0;
+    bool overflow = false;
+    io_object_t obj;
+    while ((obj = IOIteratorNext(it))) {
+        if (IOObjectConformsTo(obj, kIOMediaClass)) {
+            CFTypeRef whole = IORegistryEntryCreateCFProperty(obj, CFSTR(kIOMediaWholeKey), kCFAllocatorDefault, 0);
+            if (whole == kCFBooleanTrue) {
+                if (n < MAX_DISKS) {
+                    media[n++] = obj;
+                    obj = IO_OBJECT_NULL;
+                } else {
+                    overflow = true;
+                }
+            }
+            if (whole) CFRelease(whole);
+        }
+        if (obj) IOObjectRelease(obj);
+    }
+    IOObjectRelease(it);
+    if (overflow) {
+        for (int i = 0; i < n; i++) IOObjectRelease(media[i]);
+        return -1;
+    }
     return n;
 }
 
-struct unmount_result {
-    bool done;
-    bool ok;
-};
+struct unmount_result { bool done, abandoned; DAReturn status; };
 
 static void unmount_cb(DADiskRef disk, DADissenterRef dissenter, void *ctx)
 {
     struct unmount_result *r = ctx;
+    (void)disk;
     r->done = true;
-    r->ok = (dissenter == NULL);
-    if (dissenter) {
-        CFStringRef why = DADissenterGetStatusString(dissenter);
-        char buf[256] = "";
-        if (why)
-            CFStringGetCString(why, buf, sizeof buf, kCFStringEncodingUTF8);
-        const char *bsd = DADiskGetBSDName(disk);
-        logmsg("could not unmount %s: 0x%x %s", bsd ? bsd : "?",
-               DADissenterGetStatus(dissenter), buf);
-    }
+    r->status = dissenter ? DADissenterGetStatus(dissenter) : kDAReturnSuccess;
+    if (dissenter)
+        logmsg("卸载失败: 0x%x", DADissenterGetStatus(dissenter));
+    if (r->abandoned) free(r);
 }
 
-/* Whether the DiskArbitration disk is still this registry object */
+static int try_unmount(DADiskRef disk, DADiskUnmountOptions options, double deadline)
+{
+    struct unmount_result *r = calloc(1, sizeof *r);
+    if (!r) return -1;
+    DADiskUnmount(disk, kDADiskUnmountOptionWhole | options, unmount_cb, r);
+    while (!r->done && monotime() < deadline)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+    if (!r->done) {
+        /* 回调可能晚于超时；上下文由迟到的回调释放，不引用已返回的栈。 */
+        r->abandoned = true;
+        return -1;
+    }
+    int ok = r->status == kDAReturnSuccess || r->status == kDAReturnNotMounted ? 1 :
+        r->status == kDAReturnBusy ? 0 :
+        r->status == kDAReturnNotPrivileged ? -3 : -2;
+    free(r);
+    return ok;
+}
+
 static bool same_media(DADiskRef disk, io_object_t media)
 {
     io_service_t current = DADiskCopyIOMedia(disk);
     bool same = current && IOObjectIsEqualTo(current, media);
-    if (current)
-        IOObjectRelease(current);
+    if (current) IOObjectRelease(current);
     return same;
 }
 
-static bool is_read_only(DADiskRef disk)
+static bool force_allowed(int result, bool readonly, bool same)
 {
-    bool ro = false;
-    CFDictionaryRef desc = DADiskCopyDescription(disk);
-    if (desc) {
-        ro = CFDictionaryGetValue(desc, kDADiskDescriptionMediaWritableKey) == kCFBooleanFalse;
-        CFRelease(desc);
-    }
-    return ro;
+    return result == 0 && readonly && same;
 }
 
-static bool try_unmount(DADiskRef disk, DADiskUnmountOptions options)
+/* 本机实测 DA 直接调用被拒绝，而系统 diskutil 可由当前用户正常卸载。
+   只在该错误下回退到系统工具，不使用 sudo、shell 或强制卸载选项。 */
+static bool system_unmount(const char *bsd, double deadline)
 {
-    struct unmount_result r = { false, false };
-    DADiskUnmount(disk, kDADiskUnmountOptionWhole | options, unmount_cb, &r);
-    for (int i = 0; i < 60 && !r.done; i++)
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, true);
-    return r.ok;
+    if (!bsd || monotime() >= deadline - 2) return false;
+    char *args[] = { "/usr/sbin/diskutil", "unmountDisk", (char *)bsd, NULL };
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions)) return false;
+    posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
+    pid_t pid;
+    int result = posix_spawn(&pid, args[0], &actions, NULL, args, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (result) return false;
+    double until = monotime() + 15;
+    if (until > deadline - 1) until = deadline - 1;
+    int status = 0;
+    do {
+        pid_t reaped = waitpid(pid, &status, WNOHANG);
+        if (reaped == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (reaped < 0) return false;
+        usleep(100000);
+    } while (monotime() < until);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return false;
 }
 
-/* Unmounts every volume of a disk; true if nothing is left mounted.
-   If it is busy, unmounting is only forced on a read-only disk (the
-   virtual CD), where nothing can be lost; the memory card never is. */
-static bool unmount_disk(DASessionRef session, io_object_t media)
+static bool unmount_disk(DASessionRef session, io_object_t media, double deadline)
 {
     DADiskRef disk = DADiskCreateFromIOMedia(kCFAllocatorDefault, session, media);
-    if (!disk)
-        return true; /* already gone */
-    const char *name = DADiskGetBSDName(disk);
-    char bsd[32];
-    snprintf(bsd, sizeof bsd, "%s", name ? name : "?");
-
-    bool ok = false, gone = false;
-    for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
-        if (!same_media(disk, media)) {
-            gone = true;
-            break;
-        }
-        ok = try_unmount(disk, kDADiskUnmountOptionDefault);
-        if (!ok)
-            sleep(1);
+    if (!disk) return false;
+    bool readonly = false;
+    CFDictionaryRef desc = DADiskCopyDescription(disk);
+    if (desc) {
+        readonly = CFDictionaryGetValue(desc, kDADiskDescriptionMediaWritableKey) == kCFBooleanFalse;
+        CFRelease(desc);
     }
-    if (!ok && !gone && same_media(disk, media) && is_read_only(disk)) {
-        logmsg("%s is read-only: forcing the unmount", bsd);
-        ok = try_unmount(disk, kDADiskUnmountOptionForce);
+    if (!same_media(disk, media)) {
+        CFRelease(disk);
+        return false;
+    }
+    const char *name = DADiskGetBSDName(disk);
+    logmsg("卸载目标设备卷 %s (%s)", name ? name : "?", readonly ? "只读" : "可写");
+    double limit = monotime() + 15;
+    if (limit > deadline) limit = deadline;
+    int result = try_unmount(disk, kDADiskUnmountOptionDefault, limit);
+    if (result == -3 && same_media(disk, media)) {
+        logmsg("DiskArbitration 权限不足，改用系统 diskutil 正常卸载目标卷");
+        result = system_unmount(name, deadline) ? 1 : -2;
+    }
+    if (force_allowed(result, readonly, same_media(disk, media))) {
+        logmsg("只读安装光盘忙，尝试强制卸载；不对可写卷使用此操作");
+        limit = monotime() + 10;
+        if (limit > deadline) limit = deadline;
+        result = try_unmount(disk, kDADiskUnmountOptionForce, limit);
     }
     CFRelease(disk);
-    if (gone)
-        logmsg("%s is gone", bsd);
-    else if (ok)
-        logmsg("unmounted %s", bsd);
-    return ok || gone;
+    return result == 1;
 }
 
-/* Sends the mode switch request. Returns the IOKit result code. */
 static IOReturn send_switch(io_service_t dev)
 {
     IOCFPlugInInterface **plugin = NULL;
     IOUSBDeviceInterface **usb = NULL;
     SInt32 score;
     IOReturn kr = IOCreatePlugInInterfaceForService(dev, kIOUSBDeviceUserClientTypeID,
-                                                    kIOCFPlugInInterfaceID, &plugin, &score);
+        kIOCFPlugInInterfaceID, &plugin, &score);
     if (kr != kIOReturnSuccess || !plugin)
         return kr ? kr : kIOReturnError;
     HRESULT hr = (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
-                                           (LPVOID *)&usb);
+        (LPVOID *)&usb);
     IODestroyPlugInInterface(plugin);
-    if (hr || !usb)
-        return kIOReturnError;
-
-    /* mbbservice opens it first; if someone else holds it, send anyway */
+    if (hr || !usb) return kIOReturnError;
+    /* 保留华为原服务的行为：接口已被存储驱动打开时仍可尝试控制请求。 */
     IOReturn open_kr = (*usb)->USBDeviceOpen(usb);
     if (open_kr != kIOReturnSuccess)
-        logmsg("USBDeviceOpen: 0x%x, sending without opening", open_kr);
-
+        logmsg("USBDeviceOpen: 0x%x，尝试设备控制请求", open_kr);
     IOUSBDevRequest req = {
-        .bmRequestType = SWITCH_REQTYPE,
-        .bRequest = SWITCH_REQUEST,
-        .wValue = 0,
-        .wIndex = 0,
-        .wLength = 0,
-        .pData = NULL,
+        .bmRequestType = 0x40, .bRequest = 0xA1,
+        .wValue = 0, .wIndex = 0, .wLength = 0, .pData = NULL,
     };
     kr = (*usb)->DeviceRequest(usb, &req);
-
-    if (open_kr == kIOReturnSuccess)
-        (*usb)->USBDeviceClose(usb);
+    if (open_kr == kIOReturnSuccess) (*usb)->USBDeviceClose(usb);
     (*usb)->Release(usb);
     return kr;
 }
 
-/* Is a device in CD-ROM mode still connected at this USB location? */
-static bool still_present(int64_t location)
+static int wait_ready(int64_t location, double deadline)
 {
-    io_iterator_t it;
-    if (usb_devices(&it) != KERN_SUCCESS)
-        return false;
-    bool found = false;
-    io_service_t dev;
-    while ((dev = IOIteratorNext(it))) {
-        if (is_huawei_cdrom(dev) && int_property(dev, CFSTR(kUSBDevicePropertyLocationID)) == location)
-            found = true;
-        IOObjectRelease(dev);
-    }
-    IOObjectRelease(it);
-    return found;
-}
-
-static int switch_device(DASessionRef session, io_service_t dev)
-{
-    int64_t pid = int_property(dev, CFSTR(kUSBProductID));
-    int64_t location = int_property(dev, CFSTR(kUSBDevicePropertyLocationID));
-    logmsg("found %04x:%04llx at 0x%08llx", HUAWEI_VID, (long long)pid, (long long)location);
-
-    /* Let the system finish setting up the device and mounting its volumes */
-    mach_timespec_t quiet = { 10, 0 };
-    IOServiceWaitQuiet(dev, &quiet);
-    sleep(2);
-
-    io_object_t media[MAX_DISKS];
-    int ndisks = find_disks(dev, media, MAX_DISKS);
-    bool unmounted = true;
-    for (int i = 0; i < ndisks; i++) {
-        if (unmounted && !unmount_disk(session, media[i]))
-            unmounted = false;
-        IOObjectRelease(media[i]);
-    }
-    if (!unmounted) {
-        logmsg("not switching: a volume is still mounted; eject it and plug the device in again");
-        return 1;
-    }
-
-    IOReturn kr = send_switch(dev);
-    logmsg("switch request sent (0x%x)", kr);
-
-    /* The device disconnects as soon as it gets it, sometimes without answering */
-    for (int i = 0; i < 20; i++) {
-        if (!still_present(location)) {
-            logmsg("switched: the device comes back in network mode");
-            return 0;
+    enum state last = QUERY_ERROR;
+    do {
+        struct device d;
+        int count = scan(location, &d);
+        enum state current = classify(count, &d);
+        if (current != last) {
+            logmsg("等待状态: %s", state_name(current));
+            last = current;
         }
-        usleep(500000);
-    }
-    logmsg("the device is still in CD-ROM mode after the request");
-    return 1;
+        if (current == READY || current == QUERY_ERROR || current == AMBIGUOUS || current == UNSUPPORTED) {
+            report(count, &d);
+            release_device(&d);
+            return state_exit(current);
+        }
+        release_device(&d);
+        usleep(250000);
+    } while (monotime() < deadline);
+    logmsg("等待超时: %s；未证明 USB 联网成功", state_name(last));
+    return 5;
 }
 
-static int switch_all(void)
+static int switch_one(void)
 {
-    io_iterator_t it;
-    if (usb_devices(&it) != KERN_SUCCESS) {
-        logmsg("could not query the IOKit registry");
+    double deadline = monotime() + WAIT_SECONDS - 1;
+    struct device d;
+    int count = scan(-1, &d);
+    enum state s = classify(count, &d);
+    report(count, &d);
+    if (s != CDROM) {
+        int64_t location = d.location;
+        release_device(&d);
+        if (s == WAIT_DRIVER || s == WAIT_INTERFACE || s == WAIT_ADDRESS)
+            return wait_ready(location, deadline);
+        return state_exit(s);
+    }
+    if (d.location < 0) {
+        release_device(&d);
         return 1;
     }
+    int64_t location = d.location;
     DASessionRef session = DASessionCreate(kCFAllocatorDefault);
     if (!session) {
-        logmsg("could not open a DiskArbitration session");
-        IOObjectRelease(it);
+        logmsg("无法创建 DiskArbitration 会话");
+        release_device(&d);
         return 1;
     }
     DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-
-    int found = 0, failed = 0;
-    io_service_t dev;
-    while ((dev = IOIteratorNext(it))) {
-        if (is_huawei_cdrom(dev)) {
-            found++;
-            failed += switch_device(session, dev);
-        }
-        IOObjectRelease(dev);
+    mach_timespec_t quiet = { 5, 0 };
+    IOReturn quiet_result = IOServiceWaitQuiet(d.service, &quiet);
+    io_object_t media[MAX_DISKS];
+    int ndisks = quiet_result == kIOReturnSuccess ? find_disks(d.service, media) : -1;
+    bool ok = ndisks >= 0;
+    for (int i = 0; i < ndisks; i++) {
+        if (ok) ok = unmount_disk(session, media[i], deadline);
+        IOObjectRelease(media[i]);
     }
-    IOObjectRelease(it);
     DASessionUnscheduleFromRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
     CFRelease(session);
+    if (!ok || monotime() >= deadline) {
+        logmsg("未发送切换请求：设备或卷尚未就绪");
+        release_device(&d);
+        return 1;
+    }
+    /* 一次调用只发一条请求；重新枚举导致的请求错误仍须用实际网卡状态判定。 */
+    IOReturn kr = send_switch(d.service);
+    logmsg("已尝试一次切换请求，返回 0x%x", kr);
+    release_device(&d);
+    return wait_ready(location, deadline);
+}
 
-    if (!found)
-        logmsg("no Huawei HiLink device in CD-ROM mode");
-    return failed ? 1 : 0;
+static int acquire_lock(void)
+{
+    char path[1024];
+    size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof path);
+    if (!len || len + 32 >= sizeof path) return -1;
+    strlcat(path, "local.hilink-switch.lock", sizeof path);
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd; /* 随进程退出释放锁；不删除锁文件，避免并发打开不同 inode。 */
+}
+
+static void timed_out(int signal_number)
+{
+    (void)signal_number;
+    static const char message[] = "hilink-switch: 总操作超过 60 秒，退出；未确认成功\n";
+    (void)write(STDERR_FILENO, message, sizeof message - 1);
+    _exit(5);
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc > 1 && strcmp(argv[1], "--launchd") == 0) {
-        /* launchd starts us for an IOKit event: it must be consumed, or
-           launchd would keep starting us again */
-        dispatch_queue_t q = dispatch_queue_create("hilink-switch.events", NULL);
-        xpc_set_event_stream_handler("com.apple.iokit.matching", q, ^(xpc_object_t ev) {
-            (void)ev;
-        });
-        sleep(1);
-    } else if (argc > 1) {
-        fprintf(stderr, "usage: %s [--launchd]\n", argv[0]);
+    bool status = argc == 1 || (argc == 2 && !strcmp(argv[1], "--status"));
+    bool background = argc == 2 && !strcmp(argv[1], "--launchd");
+    bool action = argc == 2 && !strcmp(argv[1], "--switch");
+    if (!status && !background && !action) {
+        fprintf(stderr, "usage: %s [--status|--switch|--launchd]\n", argv[0]);
         return 2;
     }
-    return switch_all();
+    if (status) {
+        struct device d;
+        int count = scan(-1, &d);
+        report(count, &d);
+        int result = state_exit(classify(count, &d));
+        release_device(&d);
+        return result;
+    }
+    if (background) {
+        dispatch_queue_t q = dispatch_queue_create("hilink-switch.events", NULL);
+        xpc_set_event_stream_handler("com.apple.iokit.matching", q, ^(xpc_object_t event) {
+            (void)event;
+        });
+    }
+    int lockfd = acquire_lock();
+    if (lockfd < 0) {
+        logmsg("已有切换任务运行，或无法取得当前用户的互斥锁");
+        return 75;
+    }
+    signal(SIGALRM, timed_out);
+    alarm(WAIT_SECONDS);
+    int result = switch_one();
+    alarm(0);
+    close(lockfd);
+    /* 登录时未插入设备属正常状态；手动执行仍返回 absent。 */
+    return background && result == 3 ? 0 : result;
 }
